@@ -3,7 +3,7 @@
 # PointJEPA-grasping
 
 [![arXiv](https://img.shields.io/badge/arXiv-2501.01234-b31b1b.svg)](https://arxiv.org/abs/2509.13349)
-[![IROS 2025 – FMRD Workshop](https://img.shields.io/badge/IROS%202025-FMRD%20Workshop-blue.svg)]([https://www.iros2025.org/](https://sites.google.com/g.ecc.u-tokyo.ac.jp/iros2025-ws-roboticdesign/))
+[![IROS 2025 – FMRD Workshop](https://img.shields.io/badge/IROS%202025-FMRD%20Workshop-blue.svg)](https://sites.google.com/g.ecc.u-tokyo.ac.jp/iros2025-ws-roboticdesign/)
 
 > **Status:** accepted for the IROS 2025 FMRD Workshop.
 
