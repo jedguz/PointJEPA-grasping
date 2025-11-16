@@ -1,0 +1,39 @@
+# ────────────────────────────────────────────────────────────────
+# configs/train_joint_hdd.yaml
+#   • runs from the repo root on your HDD copy
+#   • uses lazy loading (preload_all: false)
+#   • 10 % subset manifest
+#
+# for hdd testing run ./data/robot_hand_dataset_loader.sh gs://adlr2025-pointclouds/grasps/student_grasps_v1/studentGrasping_v1.tar.gz data/student_grasping 100 --mode ordered --by categories
+# ────────────────────────────────────────────────────────────────
+defaults:
+  - train_joint        # base SSD config
+  - _self_
+
+data:
+  # absolute path to the HDD dataset -----------------------------
+  root_dir: data/student_grasping #/studentGrasping/student_grasps_v1
+
+  # local cache so you don't write into /mnt/disks/ssd ----------
+  ssd_cache_dir: cache
+
+  # 10 % split manifest (relative paths stay portable) ----------
+  split_file: configs/splits_new/split_02.json  # 10 / 25/ 50 / 100
+
+  # NEW flag: lazy or eager preload -----------------------------
+  preload_all: false
+
+  batch_size:   16
+  num_workers:  2
+  score_temp:   0.0
+
+trainer:
+#  default_root_dir: artifacts_hdd
+  max_epochs: 10
+ # log_every_n_steps: 2
+
+ # ─── logging ────────────────────────────────────────────────
+logger:
+  project: adlr
+  entity: ADLR2025
+  name: checkpoint_10percent_newsplit

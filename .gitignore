@@ -1,0 +1,65 @@
+# python
+__pycache__/
+*.py[cod]
+# data
+# checkpoints
+wandb/
+src/ext/jepa3d/locate3d_data/dataset/*.json
+src/ext/jepa3d/locate3d_data/dataset/*.json
+.venv/
+.test-env/
+.env/
+build/
+dist/
+*.egg-info/
+*.egg-info
+src/ADLR.egg-info
+*.egg-info/
+/test-env/
+shapenet_data/
+shapenet_extracted/
+pointclouds/
+*.obj
+#*.ply
+#*.npy
+#*.npz
+*.zip
+checkpoints/pre_point2vec-epoch.799-step.64800.ckpt
+checkpoints/pretrain_pointjepa_epoch=499-step=40500.ckpt
+
+# Hydra & outputs
+/.hydra/
+/outputs/
+
+# Weights & Biases
+/wandb/
+/wandb-*
+
+# PyTorch Lightning
+/lightning_logs/
+/artifacts_npz_simple2/
+/checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+.venv/
+
+# Misc
+*.log
+
+data/student_grasping/studentGrasping/
+cache
+
+multirun
+multirun/2025-08-03
+
+data/studentGrasping
+misc/
+urdfs/
+configs/checkpoints
+old_scripts/
+setup.md
+.vscode/

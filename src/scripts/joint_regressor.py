@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+JointRegressor – predicts 12‑D hand‑joint configuration from
+ • an object point cloud, transformed into a global object embedding
+ • a 7‑D hand pose (translation + quaternion)
+
+Supports Point‑JEPA fine‑tuning, and multi‑hypothesis (k‑best) outputs.
+To enable multi-hypothesis outputs, set loss_type to "min_k_logit".
+"""
+
+from __future__ import annotations
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+
+from utils.transforms    import PointcloudCoordChange
+from modules.tokenizer   import PointcloudTokenizer
+from modules.transformer import TransformerEncoder
+from utils               import transforms
+from scripts.pooling     import get_pooling
+from typing import Optional 
+
+
+class JointRegressor(pl.LightningModule):
+    # --------------------------------------------------------- init
+    def __init__(
+        self,
+        *,
+        num_points: int,
+        tokenizer_groups: int,
+        tokenizer_group_size: int,
+        tokenizer_radius: float,
+        transformations: list[str],
+        coord_change: bool,
+        encoder_dim: int,
+        encoder_depth: int,
+        encoder_heads: int,
+        encoder_dropout: float,
+        encoder_attn_dropout: float,
+        encoder_drop_path_rate: float,
+        encoder_mlp_ratio: float,
+        head_dropout: float = 0.10,
+        pooling_type: str,
+        pooling_heads: int,
+        pooling_dropout: float,
+        head_hidden_dims: list[int],
+        pose_dim: int = 7,
+        lr_backbone: float = 1e-4,
+        lr_head: float = 3e-3,
+        weight_decay: float = 1e-2,
+        encoder_unfreeze_epoch: int = 0,
+        encoder_unfreeze_step: int = 0,
+        num_pred: int = 5,
+        loss_type: str = "min_k_logit",
+        logit_scale_init: float = 0.1,  
+        logit_scale_min:  float = 0.01,
+        logit_scale_max:  float = 6.0,   
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.coord_change            = coord_change
+        self.num_pred                = num_pred
+        self.loss_type               = loss_type
+        self.encoder_unfreeze_step  = encoder_unfreeze_step
+
+        # ---------------- tokenizer --------------------------
+        self.tokenizer = PointcloudTokenizer(
+            num_groups   = tokenizer_groups,
+            group_size   = tokenizer_group_size,
+            group_radius = tokenizer_radius,
+            token_dim    = encoder_dim,
+        )
+
+        # -------------- positional encoding ------------------
+        self.positional_encoding = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+            nn.Linear(128, encoder_dim),
+        )
+        self.pe_scale = nn.Parameter(torch.tensor(0.3))
+
+        # ---------------- transformer backbone ---------------
+        dpr = torch.linspace(0, encoder_drop_path_rate, encoder_depth).tolist()
+        self.encoder = TransformerEncoder(
+            embed_dim       = encoder_dim,
+            depth           = encoder_depth,
+            num_heads       = encoder_heads,
+            mlp_ratio       = encoder_mlp_ratio,
+            qkv_bias        = True,
+            drop_rate       = encoder_dropout,
+            attn_drop_rate  = encoder_attn_dropout,
+            drop_path_rate  = dpr,
+            add_pos_at_every_layer = True,
+        )
+
+        # ------------------- pooling -------------------------
+        self.pool = get_pooling(
+            pooling_type, dim=encoder_dim,
+            num_heads=pooling_heads,
+            dropout=pooling_dropout,
+        )
+
+        # ------------------- head ----------------------------
+        if self.coord_change:
+            in_dim = encoder_dim
+        else:
+            in_dim = encoder_dim + pose_dim
+
+        if   loss_type == "basic":        out_dim = 12
+        elif loss_type == "min_k":        out_dim = 12 * num_pred
+        elif loss_type == "min_k_logit":  out_dim = (12 + 1) * num_pred   # k·(12+1)
+        elif loss_type == "full":         out_dim = (12 + 2) * num_pred   # k·(12+2)
+        else:
+            raise ValueError(f"Unknown loss type '{loss_type}'.")
+
+        dims = [in_dim] + head_hidden_dims + [out_dim]
+
+        # Print network architecture
+        print(f"\n{'='*50}")
+        print(f"MLP Head Architecture (loss_type: {self.loss_type})")
+        print(f"{'='*50}")
+        print(f"Input dimension: {in_dim}")
+        print(f"Hidden dimensions: {head_hidden_dims}")
+        print(f"Output dimension: {dims[-1]}")
+        print(f"\nLayer-by-layer breakdown:")
+        print(f"{'-'*50}")
+
+        mlp: list[nn.Module] = []
+        for i in range(len(dims) - 2):
+            mlp.extend([
+                nn.Linear(dims[i], dims[i + 1]),
+                nn.ReLU(),
+                nn.Dropout(head_dropout)          # ← NEW
+            ])
+        mlp.append(nn.Linear(dims[-2], dims[-1]))
+        self.head = nn.Sequential(*mlp)
+
+        # learnable scale on the logit/KL term
+        if loss_type in {"min_k_logit", "full"}:
+            self.logit_scale_raw = nn.Parameter(torch.log(
+            torch.tensor(logit_scale_init)
+        ))
+
+        # -------- data‑space transforms (optional)------------
+        if transformations[0] != "none":
+            self.train_transformations = transforms.Compose(
+                [self.build_transformation(n) for n in transformations]
+            )
+        else:
+            self.train_transformations = transformations
+
+    # convenience property
+    @property
+    def logit_scale(self) -> torch.Tensor:
+        return self.logit_scale_raw.exp().clamp(
+            self.hparams.logit_scale_min,
+            self.hparams.logit_scale_max
+        )
+
+    # ------------------------------------------------ forward
+    @torch.cuda.amp.autocast(enabled=True)
+    def forward(self, points: torch.Tensor, pose_vec: torch.Tensor):
+        tokens, centers = self.tokenizer(points)
+        pos   = self.positional_encoding(centers) * self.pe_scale
+        feats = self.encoder(tokens, pos).last_hidden_state
+        obj_emb = self.pool(feats)
+
+        # If coord_change is enabled, transform object pc to hand pose frame
+        if self.coord_change:
+            transformation = PointcloudCoordChange(pose_vec)
+            points = transformation(points)
+            tokens, centers = self.tokenizer(points)
+            pos   = self.positional_encoding(centers) * self.pe_scale
+            feats = self.encoder(tokens, pos).last_hidden_state
+            obj_emb = self.pool(feats)
+            pred    = self.head(obj_emb) 
+        else:
+            tokens, centers = self.tokenizer(points)
+            pos   = self.positional_encoding(centers) * self.pe_scale
+            feats = self.encoder(tokens, pos).last_hidden_state
+            obj_emb = self.pool(feats)
+            fused   = torch.cat([obj_emb, pose_vec], dim=-1)
+            pred    = self.head(fused)
+
+        pred_dim = self.num_pred * 12
+
+        if self.loss_type == "basic":
+            return pred                                   # (B,12)
+
+        if self.loss_type == "min_k":
+            return pred.view(-1, self.num_pred, 12)       # (B,k,12)
+
+        if self.loss_type == "min_k_logit":
+            angles = pred[:, :pred_dim].view(-1, self.num_pred, 12)
+            logits = pred[:, pred_dim:].view(-1, self.num_pred)
+            return angles, logits
+
+        # full
+        angles = pred[:, :pred_dim].view(-1, self.num_pred, 12)
+        logits = pred[:, pred_dim : pred_dim + self.num_pred].view(-1, self.num_pred)
+        scores = pred[:, pred_dim + self.num_pred :].view(-1, self.num_pred)
+        return angles, logits, scores
+
+    # -------------------------------------- training / val
+    def _step(self, batch, stage: str):
+        # ── fast host→GPU copy (requires pin_memory=True in DataLoader) ──
+        points = batch["points"].to(self.device, non_blocking=True)
+        pose   = batch["pose"]  .to(self.device, non_blocking=True)
+        joints = batch["joints"].to(self.device, non_blocking=True)
+
+        loss_terms = {}
+        B = points.size(0)
+
+        # ------------------------------------------------------------- losses
+        if self.loss_type == "basic":
+            pred = self(points, pose)                               # (B,12)
+            loss_terms["angles"] = F.mse_loss(pred, joints)
+
+        elif self.loss_type == "min_k":
+            angles = self(points, pose)                             # (B,k,12)
+            per_h  = (angles - joints.unsqueeze(1)).pow(2).mean(-1) # (B,k)
+            loss_terms["angles"] = per_h.min(-1).values.mean()
+
+        elif self.loss_type == "min_k_logit":
+            angles, logits = self(points, pose)                     # (B,k,12)
+            per_h  = (angles - joints.unsqueeze(1)).pow(2).mean(-1)
+            min_idx = torch.argmin(per_h, dim=1)                    # (B,)
+            loss_terms["angles"] = per_h.min(-1).values.mean()
+            loss_terms["logit"]  = self.logit_scale * F.cross_entropy(logits, min_idx)
+
+        else:  # loss_type == "full"
+            angles, logits, scores = self(points, pose)
+            per_h  = (angles - joints.unsqueeze(1)).pow(2).mean(-1)
+            min_idx = torch.argmin(per_h, dim=1)
+            pred_score = scores.gather(1, min_idx.unsqueeze(1)).squeeze(1)
+            loss_terms["angles"] = per_h.min(-1).values.mean()
+            loss_terms["logit"]  = self.logit_scale * F.cross_entropy(logits, min_idx)
+            loss_terms["score"]  = 0.01 * F.mse_loss(
+                pred_score,
+                batch["meta"]["score"].to(self.device, non_blocking=True),
+            )
+
+        # ---------------------------------------------------------- logging
+        total = 0.0
+        for k, v in loss_terms.items():
+            self.log(f"{stage}_loss_{k}", v, prog_bar=True, batch_size=B)
+            total += v
+        self.log(f"{stage}_loss", total, prog_bar=True, batch_size=B)
+        if hasattr(self, "logit_scale_raw"):
+            self.log(f"{stage}_logit_scale", self.logit_scale.item(), prog_bar=True)
+
+        return total
+
+    def training_step  (self, batch, _): return self._step(batch, "train")
+
+    # --------------------------------------------------------------------------
+    def validation_step(self, batch, batch_idx):
+        """Logs per-batch losses *and* returns tensors for epoch-level metrics."""
+        self._step(batch, "val")                     # existing loss logging
+
+        # -------- forward pass -------------------------------------------------
+        if self.loss_type == "basic":
+            angles = self(batch["points"], batch["pose"])       # (B,12)
+            logits = None
+            scores = None
+        elif self.loss_type == "min_k":
+            angles = self(batch["points"], batch["pose"])       # (B,k,12)
+            logits = None
+            scores = None
+        elif self.loss_type == "min_k_logit":
+            angles, logits = self(batch["points"], batch["pose"])
+            scores = None
+        else:                                                   # loss_type == "full"
+            angles, logits, scores = self(batch["points"], batch["pose"])
+
+        return {
+            "pred_angles": angles.detach(),
+            "pred_logits": logits.detach() if logits is not None else None,
+            "pred_scores": scores.detach() if scores is not None else None,
+            "gt_angles":   batch["joints"].detach(),
+        }
+
+
+    def test_step(self, batch, batch_idx):
+        """Identical to validation_step so callbacks run on the test loop, too."""
+        self._step(batch, "test")
+
+        # -------- forward pass -------------------------------------------------
+        if self.loss_type == "basic":
+            angles = self(batch["points"], batch["pose"])       # (B,12)
+            logits = None
+            scores = None
+        elif self.loss_type == "min_k":
+            angles = self(batch["points"], batch["pose"])       # (B,k,12)
+            logits = None
+            scores = None
+        elif self.loss_type == "min_k_logit":
+            angles, logits = self(batch["points"], batch["pose"])
+            scores = None
+        else:                                                   # loss_type == "full"
+            angles, logits, scores = self(batch["points"], batch["pose"])
+
+        return {
+            "pred_angles": angles.detach(),
+            "pred_logits": logits.detach() if logits is not None else None,
+            "pred_scores": scores.detach() if scores is not None else None,
+            "gt_angles":   batch["joints"].detach(),
+        }
+    # --------------------------------------------------------------------------
+
+    # -------------------------------------- optimiser
+    def configure_optimizers(self):
+        backbone_params = (
+            list(self.tokenizer.parameters()) +
+            list(self.positional_encoding.parameters()) +
+            list(self.encoder.parameters())
+        )
+        head_params = list(self.pool.parameters()) + list(self.head.parameters())
+
+        scale_params = [self.pe_scale]
+        if hasattr(self, "logit_scale_raw"):
+            scale_params.append(self.logit_scale_raw)
+
+        optim = torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": self.hparams.lr_backbone},
+                {"params": head_params,     "lr": self.hparams.lr_head},
+                {"params": scale_params,    "lr": 1e-4},
+            ],
+            weight_decay=self.hparams.weight_decay,
+        )
+
+        # cosine LR with warm‑up
+        def lr_lambda(step):
+            warmup = 10 * self.trainer.num_training_batches
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = (step - warmup) / max(1, self.trainer.max_steps - warmup)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
+        return {"optimizer": optim,
+                "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+    # ---------- transformations for point clouds ----------
+    @staticmethod
+    def build_transformation(name: str) -> transforms.Transform:
+        if   name == "subsample":   return transforms.PointcloudSubsampling(1024)
+        elif name == "center":      return transforms.PointcloudCentering()
+        elif name == "unit_sphere": return transforms.PointcloudUnitSphere()
+        elif name == "rotate":      return transforms.PointcloudRotation(dims=[1])
+        else: raise RuntimeError(f"No such transformation: {name}")
+
+    # ---------- DEBUG SECTION --------------------------
+    def on_after_backward(self) -> None:
+        """Runs every time Lightning has done loss.backward()."""
+        if self.global_step > 0:                      # only once
+            return
+
+        bb_nonzero, bb_total = 0, 0
+        for p in self.encoder.parameters():
+            if p.requires_grad:
+                bb_total += 1
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    bb_nonzero += 1
+        self.print(f"[GRAD-CHK] encoder tensors with grad: {bb_nonzero}/{bb_total}")
+
+    def on_train_batch_end(self, *_):
+        """Verify at least one encoder weight changed after opt.step()."""
+        if self.global_step == 0:
+            # cache a copy of weights after first backward
+            self._enc_before = [
+                p.detach().clone() for p in self.encoder.parameters()
+                if p.requires_grad
+            ]
+        elif self.global_step == 1 and hasattr(self, "_enc_before"):
+            delta = sum(
+                (after - before).abs().sum().item()
+                for before, after in zip(self._enc_before, self.encoder.parameters())
+                if after.requires_grad
+            )
+            self.print(f"[WEIGHT-CHK] Σ|Δw_encoder| after 1 step = {delta:.3e}")
+            del self._enc_before            # keep RAM clean
+    # ---------- END DEBUG -------------------------------------
+
+    # --------------- freeze / unfreeze hooks --------------
+    def on_train_start(self):
+        if self.encoder_unfreeze_step > 0:
+            for m in (self.tokenizer, self.positional_encoding, self.encoder):
+                m.requires_grad_(False)
+
+    """ EPOCH LOGIC -> NOW STEP LOGIC
+    def on_train_epoch_start(self):
+        if self.current_epoch == self.encoder_unfreeze_epoch:
+            self.print(f">> Unfreezing encoder at epoch {self.current_epoch}")
+            for m in (self.tokenizer, self.positional_encoding, self.encoder):
+                m.requires_grad_(True)
+    """
+
+    def on_train_batch_start(self, batch, batch_idx):
+        if self.global_step == self.encoder_unfreeze_step:
+            self.print(f">> Unfreezing encoder at step {self.global_step}")
+            for m in (self.tokenizer, self.positional_encoding, self.encoder):
+                m.requires_grad_(True)
